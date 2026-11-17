@@ -21,7 +21,7 @@ Model (fitted at run time from the case file's own comparables, stdlib only):
   unlock means the launch is already under way, so P(type 2) is capped.
 
   Backtest (leave-one-out over the kit's 37 full-day comparables):
-  mean pinball loss 0.39 overall (type 1: 0.20, type 2: 0.74) against the
+  mean pinball loss 0.395 overall (type 1: 0.204, type 2: 0.748) against the
   house persistence baseline's 0.93 (type 1: 0.28, type 2: 2.26). The
   house baseline scores ~0.387 on the practice cases; this model should
   score ~0.20-0.25 there.
@@ -244,7 +244,13 @@ class Forecaster:
                     inters.append(inters[-1] if inters else 0.0)
                     slopes.append(slopes[-1] if slopes else 0.0)
                     sds.append(sds[-1] if sds else 0.5)
-            win = 3 if t == 1 else 5
+            # No smoothing across hours (win 1): with ~24-37 launches per
+            # regime each hour's fit already averages enough points, and
+            # smoothing biased the steep type-2 rise (hours 5-10, where the
+            # log-ratio climbs ~0.2 to ~1.9) and the type-1 evening peak.
+            # Leave-one-out backtest: win 1 beats win 3/5 on both regimes
+            # (overall 0.3952 vs 0.3962 baseline).
+            win = 1
             sm = smooth(inters, win)
             self.m[t] = [(sm[i], slopes[i]) for i in range(len(sm))]
             self.s[t] = smooth(sds, win)
