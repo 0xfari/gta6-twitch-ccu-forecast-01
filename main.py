@@ -17,7 +17,11 @@ Model (fitted at run time from the case file's own comparables, stdlib only):
   evening), log10 hour-1 / baseline (how surprising the launch is),
   log10 viewers-per-channel at hour 1 (concentrated vs broad attention),
   and a weekend flag (releases on Fri/Sat/Sun shape differently), with a
-  robust residual spread per hour. The
+  robust residual spread per hour. Each hour's intercept is then shifted
+  to the residual median (pinball at tau=0.5, the biggest per-tau loss
+  contributor, is minimized by the median), and the spreads are widened
+  5% (they under-covered: type-1 coverage of the 90% interval was 0.88
+  against a 0.90 nominal). The
   forecast quantiles are the quantiles of the resulting two-component
   normal mixture in log space, so a genuinely ambiguous case (hour 1 in
   the overlap zone) honestly reports a wide, bimodal spread instead of
@@ -25,11 +29,11 @@ Model (fitted at run time from the case file's own comparables, stdlib only):
   unlock means the launch is already under way, so P(type 2) is capped.
 
   Backtest (leave-one-out over the kit's 37 full-day comparables):
-  mean pinball loss 0.355 overall (type 1: 0.175, type 2: 0.686) against the
+  mean pinball loss 0.357 overall (type 1: 0.173, type 2: 0.695) against the
   house persistence baseline's 0.93 (type 1: 0.28, type 2: 2.26). The
   house baseline scores ~0.387 on the practice cases. v1 of this entry
   scored 0.271 on the practice cases (rank 2170/2419); this version's
-  leave-one-out type-1 loss is 0.175, down from v1's 0.204.
+  leave-one-out type-1 loss is 0.173, down from v2's 0.175 and v1's 0.204.
 
 How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
 python:3.13-slim, standard library only: no network, no pip packages.
@@ -311,9 +315,15 @@ class Forecaster:
                                    [p[1] - my for p in pts], lam=lam)
                     resid = [p[1] - (my + sum(b * x for b, x in zip(sl, p[0])))
                              for p in pts]
+                    # Center on the residual median, not the mean: pinball
+                    # at tau=0.5 (the biggest per-tau loss contributor) is
+                    # minimized by the median, and the log-ratio residuals
+                    # are skewed. The spread is translation-invariant, so
+                    # sd is unaffected by this shift.
+                    my = my + statistics.median(resid)
                     sd = max(0.15, statistics.pstdev(resid) if len(resid) > 1 else 0.5)
                     coefs.append([my] + sl)
-                    sds.append(sd)
+                    sds.append(sd * 1.05)  # residual sds under-cover (type-1 cov90 0.88 vs 0.90 nominal); a 5% widening restores coverage without moving the center
                 else:
                     coefs.append(coefs[-1][:] if coefs else [0.0, 0.0, 0.0, 0.0, 0.0])
                     sds.append(sds[-1] if sds else 0.5)
