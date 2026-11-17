@@ -10,10 +10,14 @@ Model (fitted at run time from the case file's own comparables, stdlib only):
   hundreds of times hour 1. Which regime a case is in is largely told by
   hour 1 itself: its size, and its size against the category's pre-release
   baseline. A two-feature logistic (log10 hour-1 viewers, log10 hour-1 /
-  baseline) gives P(type 2). Within each regime, for every hour h the
-  log-ratio log(viewers_h / viewers_1) is regressed on centered log10
-  hour-1 viewers (bigger launches decay more by evening), with a robust
-  residual spread; both are smoothed across neighbouring hours. The
+  baseline, lightly regularised so the probabilities stay honest in the
+  overlap zone) gives P(type 2). Within each regime, for every hour h the
+  log-ratio log(viewers_h / viewers_1) is regressed (ridge) on four
+  centered features: log10 hour-1 viewers (bigger launches decay more by
+  evening), log10 hour-1 / baseline (how surprising the launch is),
+  log10 viewers-per-channel at hour 1 (concentrated vs broad attention),
+  and a weekend flag (releases on Fri/Sat/Sun shape differently), with a
+  robust residual spread per hour. The
   forecast quantiles are the quantiles of the resulting two-component
   normal mixture in log space, so a genuinely ambiguous case (hour 1 in
   the overlap zone) honestly reports a wide, bimodal spread instead of
@@ -21,10 +25,11 @@ Model (fitted at run time from the case file's own comparables, stdlib only):
   unlock means the launch is already under way, so P(type 2) is capped.
 
   Backtest (leave-one-out over the kit's 37 full-day comparables):
-  mean pinball loss 0.395 overall (type 1: 0.204, type 2: 0.748) against the
+  mean pinball loss 0.355 overall (type 1: 0.175, type 2: 0.686) against the
   house persistence baseline's 0.93 (type 1: 0.28, type 2: 2.26). The
-  house baseline scores ~0.387 on the practice cases; this model should
-  score ~0.20-0.25 there.
+  house baseline scores ~0.387 on the practice cases. v1 of this entry
+  scored 0.271 on the practice cases (rank 2170/2419); this version's
+  leave-one-out type-1 loss is 0.175, down from v1's 0.204.
 
 How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
 python:3.13-slim, standard library only: no network, no pip packages.
@@ -43,6 +48,7 @@ import math
 import os
 import statistics
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # The grader's -P leaves /bot off sys.path: put it back first, so `import model` finds a model.py shipped beside this file.
@@ -50,6 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+
 
 # The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
@@ -130,6 +137,43 @@ def fit_logistic(X, ys, lam=1.0):
     return a
 
 
+def ridge_fit(X, y, lam=1.0):
+    """Ridge OLS for centered features X (no intercept column), returns slopes.
+
+    Solves (X'X + lam I) b = X'y by Gaussian elimination. lam keeps the
+    fit finite when two features nearly coincide (log h1 and log h1/base
+    track each other) and shrinks noisy slopes the way the old n/(n+8)
+    factor did for the single slope.
+    """
+    p = len(X[0])
+    A = [[sum(X[k][i] * X[k][j] for k in range(len(X))) for j in range(p)] for i in range(p)]
+    for i in range(p):
+        A[i][i] += lam
+    b = [sum(X[k][i] * y[k] for k in range(len(X))) for i in range(p)]
+    M = [row[:] + [b[i]] for i, row in enumerate(A)]
+    for col in range(p):
+        piv = max(range(col, p), key=lambda r: abs(M[r][col]))
+        M[col], M[piv] = M[piv], M[col]
+        if abs(M[col][col]) < 1e-12:
+            continue
+        for r in range(p):
+            if r != col and M[r][col] != 0.0:
+                f = M[r][col] / M[col][col]
+                for cc in range(col, p + 1):
+                    M[r][cc] -= f * M[col][cc]
+    return [M[i][p] / M[i][i] if abs(M[i][i]) > 1e-12 else 0.0 for i in range(p)]
+
+
+def is_weekend(day_start: str | None) -> float:
+    """1.0 when the release day is Fri/Sat/Sun, else 0.0 (None -> 0.0)."""
+    if not day_start:
+        return 0.0
+    try:
+        return 1.0 if datetime.strptime(day_start[:10], "%Y-%m-%d").weekday() >= 4 else 0.0
+    except ValueError:
+        return 0.0
+
+
 def day_series(comp: dict) -> dict:
     """A comparable's release-day viewers, keyed by 1-based hour (1 = 00:00-01:00 UTC)."""
     ds = comp["day_start"][:10]
@@ -145,6 +189,16 @@ def comp_base(comp: dict) -> float:
     ds = comp["day_start"][:10]
     pre = [h["viewers"] for h in comp.get("hourly", []) if h["from"][:10] < ds]
     return float(statistics.median(pre)) if pre else 1.0
+
+
+def comp_channels1(comp: dict) -> float | None:
+    """Channels in the comparable's hour 1 (00:00 UTC of its release day)."""
+    ds = comp["day_start"][:10]
+    for h in comp.get("hourly", []):
+        if h["from"][:10] == ds and int(h["from"][11:13]) == 0:
+            ch = h.get("channels")
+            return float(ch) if ch else None
+    return None
 
 
 def target_base(case: dict) -> float:
@@ -193,12 +247,17 @@ class Forecaster:
         for comp in case.get("comparables", []) or []:
             s = day_series(comp)
             if 1 in s and len(s) >= 20 and s[1] > 0:
-                series.append((s, comp_base(comp)))
+                series.append((s, comp_base(comp), comp_channels1(comp), comp.get("day_start")))
         self.coef = FALLBACK_COEF
-        self.m = {1: [(m, 0.0) for m in FALLBACK_M1], 2: [(m, 0.0) for m in FALLBACK_M2]}
+        # Per-hour fit: [intercept, slope on log10 h1, slope on log10 h1/base,
+        # slope on log10 viewers-per-channel at hour 1]. Fallback keeps the
+        # old per-hour medians with zero slopes.
+        self.m = {1: [[m, 0.0, 0.0, 0.0, 0.0] for m in FALLBACK_M1],
+                  2: [[m, 0.0, 0.0, 0.0, 0.0] for m in FALLBACK_M2]}
         self.s = {1: FALLBACK_S1, 2: FALLBACK_S2}
-        self.x1mean = {1: FALLBACK_X1MEAN1, 2: FALLBACK_X1MEAN2}
-        if len(series) >= 8 and len({1 if max(s.values()) / s[1] > 4 else 0 for s, _ in series}) == 2:
+        # Regime means of the four features, for centering.
+        self.fmean = {1: [FALLBACK_X1MEAN1, 3.0, 1.5, 0.5], 2: [FALLBACK_X1MEAN2, 3.0, 1.5, 0.5]}
+        if len(series) >= 8 and len({1 if max(s.values()) / s[1] > 4 else 0 for s, _, _, _ in series}) == 2:
             self._fit(series)
         self.rolling = rolling_midnight(case.get("notes"))
 
@@ -207,53 +266,59 @@ class Forecaster:
         ys = []
         t1 = []
         t2 = []
-        for s, base in series:
+        for s, base, ch1, ds in series:
             t = 2 if max(s.values()) / s[1] > 4 else 1
             x1 = math.log10(s[1])
             x2 = math.log10(s[1] / max(1.0, base))
             X.append([1.0, x1, x2])
             ys.append(1 if t == 2 else 0)
-            (t2 if t == 2 else t1).append((s, base))
+            (t2 if t == 2 else t1).append((s, base, ch1, ds))
         if len(t1) < 4 or len(t2) < 3:
             return
-        self.coef = fit_logistic(X, ys, lam=1.0)
+        self.coef = fit_logistic(X, ys, lam=0.3)
+        lam = 1.0
         for t, sel in ((1, t1), (2, t2)):
-            xm = statistics.mean([math.log10(s[1]) for s, _ in sel])
-            self.x1mean[t] = xm
-            inters = []
-            slopes = []
+            # Regime means of the four features.
+            mx1 = statistics.mean([math.log10(s[1]) for s, _, _, _ in sel])
+            mx2 = statistics.mean([math.log10(s[1] / max(1.0, base)) for s, base, _, _ in sel])
+            chs = [math.log10(s[1] / ch1) for s, _, ch1, _ in sel if ch1]
+            mx4 = statistics.mean(chs) if chs else 1.5
+            mwe = statistics.mean([is_weekend(ds) for _, _, _, ds in sel])
+            self.fmean[t] = [mx1, mx2, mx4, mwe]
+
+            def feats(s, base, ch1, ds):
+                x1 = math.log10(s[1]) - mx1
+                x2 = math.log10(s[1] / max(1.0, base)) - mx2
+                x4 = (math.log10(s[1] / ch1) - mx4) if ch1 else 0.0
+                return [x1, x2, x4, is_weekend(ds) - mwe]
+
+            # Per-hour points: (features, log-ratio).
+            hour_pts = {}
+            for h in range(2, 25):
+                pts = []
+                for s, base, ch1, ds in sel:
+                    if h in s and s[h] > 0:
+                        pts.append((feats(s, base, ch1, ds), math.log(s[h] / s[1])))
+                hour_pts[h] = pts
+
+            coefs = []
             sds = []
             for h in range(2, 25):
-                pts = [(math.log10(s[1]) - xm, math.log(s[h] / s[1]))
-                       for s, _ in sel if h in s and s[h] > 0]
-                if len(pts) >= 4:
-                    n = len(pts)
-                    mx = statistics.mean([p[0] for p in pts])
+                pts = hour_pts[h]
+                if len(pts) >= 6:
                     my = statistics.mean([p[1] for p in pts])
-                    vx = sum((p[0] - mx) ** 2 for p in pts)
-                    cov = sum((p[0] - mx) * (p[1] - my) for p in pts)
-                    # Shrink the slope: with ~24 launches a raw slope overfits.
-                    slope = (cov / vx) * (n / (n + 8.0)) if vx > 1e-9 else 0.0
-                    inter = my - slope * mx
-                    resid = [p[1] - (inter + slope * p[0]) for p in pts]
+                    sl = ridge_fit([p[0] for p in pts],
+                                   [p[1] - my for p in pts], lam=lam)
+                    resid = [p[1] - (my + sum(b * x for b, x in zip(sl, p[0])))
+                             for p in pts]
                     sd = max(0.15, statistics.pstdev(resid) if len(resid) > 1 else 0.5)
-                    inters.append(inter)
-                    slopes.append(slope)
+                    coefs.append([my] + sl)
                     sds.append(sd)
                 else:
-                    inters.append(inters[-1] if inters else 0.0)
-                    slopes.append(slopes[-1] if slopes else 0.0)
+                    coefs.append(coefs[-1][:] if coefs else [0.0, 0.0, 0.0, 0.0, 0.0])
                     sds.append(sds[-1] if sds else 0.5)
-            # No smoothing across hours (win 1): with ~24-37 launches per
-            # regime each hour's fit already averages enough points, and
-            # smoothing biased the steep type-2 rise (hours 5-10, where the
-            # log-ratio climbs ~0.2 to ~1.9) and the type-1 evening peak.
-            # Leave-one-out backtest: win 1 beats win 3/5 on both regimes
-            # (overall 0.3952 vs 0.3962 baseline).
-            win = 1
-            sm = smooth(inters, win)
-            self.m[t] = [(sm[i], slopes[i]) for i in range(len(sm))]
-            self.s[t] = smooth(sds, win)
+            self.m[t] = coefs
+            self.s[t] = sds
 
     def w2(self, h1: float, base: float) -> float:
         """P(later-unlock regime) from hour 1's size and its baseline ratio."""
@@ -266,15 +331,29 @@ class Forecaster:
             w = min(w, 0.05)
         return w
 
-    def quantiles(self, h1: float, base: float, h: int) -> list:
+    def quantiles(self, h1: float, base: float, h: int, ch1: float | None = None,
+                  day_start: str | None = None) -> list:
         """The five forecast quantiles (in log-ratio units) for hour h."""
         i = h - 2
         w = self.w2(h1, base)
-        x1c = math.log10(max(1.0, h1))
-        m1 = self.m[1][i][0] + self.m[1][i][1] * (x1c - self.x1mean[1])
-        m2 = self.m[2][i][0] + self.m[2][i][1] * (x1c - self.x1mean[2])
-        s1 = self.s[1][i]
-        s2 = self.s[2][i]
+        f1 = math.log10(max(1.0, h1))
+        f2 = math.log10(max(1.0, h1) / max(1.0, base))
+        f4 = math.log10(max(1.0, h1) / ch1) if ch1 else None
+        we = is_weekend(day_start) if day_start else None
+        ms = []
+        ss = []
+        for t in (1, 2):
+            b = self.m[t][i]
+            mx1, mx2, mx4, mwe = self.fmean[t]
+            m = b[0] + b[1] * (f1 - mx1) + b[2] * (f2 - mx2)
+            if f4 is not None:
+                m += b[3] * (f4 - mx4)
+            if we is not None:
+                m += b[4] * (we - mwe)
+            ms.append(m)
+            ss.append(self.s[t][i])
+        m1, m2 = ms
+        s1, s2 = ss
 
         def F(q: float) -> float:
             return (1.0 - w) * phi((q - m1) / s1) + w * phi((q - m2) / s2)
@@ -299,12 +378,15 @@ class Forecaster:
             raise ValueError("no hour-1 print")
         p1 = max(1.0, float(first["viewers"]))
         base = target_base(case)
+        ch1 = first.get("channels")
+        ch1 = float(ch1) if ch1 else None
+        ds = case.get("day_start")
         hours = []
         for row in case["forecast"]:
             h = row["hour"]
             qs = []
             prev = 0.0
-            for q in self.quantiles(p1, base, h):
+            for q in self.quantiles(p1, base, h, ch1, ds):
                 v = p1 * math.exp(q)
                 v = min(1e9, max(0.01, v))
                 v = round2(v)
